@@ -159,6 +159,8 @@ class StringParameter(BaseParameter):
     size = 10
 
     def parse_from_arg(self, s):
+        if 'None' == s:
+            return None
         return s
 
 
@@ -585,13 +587,21 @@ class ForceScheduler(base.BaseScheduler):
         codebase_dict = {}
         for codebase in codebases:
             if isinstance(codebase, basestring):
-                codebase = CodebaseParameter(codebase=codebase)
+                codebase_dict[codebase] = codebases[codebase].copy()
+            else:
+                codebase_dict[codebase.codebase] = dict(branch='',repository='',revision='')
+
+            if isinstance(codebase, basestring):
+                codebase = CodebaseParameter(codebase=codebase,
+                        branch=StringParameter(name='branch', label="Branch:", default=codebase_dict[codebase].get('branch', '')),
+                        revision=StringParameter(name='revision', label="Revision:", default=codebase_dict[codebase].get('revision', '')),
+                        repository=StringParameter(name='repository', label="Repository:", default=codebase_dict[codebase].get('repository', '')),
+                        project=StringParameter(name='project', label="Project:", default=codebase_dict[codebase].get('project', '')))
             elif not isinstance(codebase, CodebaseParameter):
                 config.error("ForceScheduler '%s': 'codebases' must be a list of strings or CodebaseParameter objects: %r" % (name, codebases))
 
             self.forcedProperties.append(codebase)
-            codebase_dict[codebase.codebase] = dict(branch='', repository='', revision='')
-
+            
         base.BaseScheduler.__init__(self,
                                     name=name,
                                     builderNames=builderNames,
@@ -643,6 +653,12 @@ class ForceScheduler(base.BaseScheduler):
                                       changes=changeids,
                                       sourcestamps=sourcestamps,
                                       kwargs=kwargs)
+
+        codebases = {} if not self.codebases else self.codebases
+        for codebase in codebases:
+            u = sourcestamps.get(codebase, {})
+            sourcestamps[codebase] = codebases[codebase].copy()
+            sourcestamps[codebase].update(u)
 
         changeids = map(lambda a: isinstance(a, int) and a or a.number, changeids)
 

@@ -365,7 +365,7 @@ else:
 
     if sys.version_info[:2] >= (2, 6):
         setup_args['install_requires'] += [
-            'twisted >= 11.0.0',
+            'twisted >= 11.0.0, < 14.0.0',
             'Jinja2 >= 2.1',
         ]
     else:

@@ -17,8 +17,11 @@ import glob
 import os
 import shutil
 import sys
+import traceback
 
 from twisted.internet import defer
+from twisted.internet import reactor
+from twisted.internet import task
 from twisted.internet import threads
 from twisted.python import log
 from twisted.python import runtime
@@ -27,7 +30,6 @@ from buildslave import runprocess
 from buildslave.commands import base
 from buildslave.commands import utils
 
-
 class MakeDirectory(base.Command):
 
     header = "mkdir"
@@ -35,17 +37,32 @@ class MakeDirectory(base.Command):
     # args['dir'] is relative to Builder directory, and is required.
     requiredArgs = ['dir']
 
+    @defer.inlineCallbacks
     def start(self):
         dirname = os.path.join(self.builder.basedir, self.args['dir'])
 
-        try:
-            if not os.path.isdir(dirname):
-                os.makedirs(dirname)
-            self.sendStatus({'rc': 0})
-        except OSError, e:
-            log.msg("MakeDirectory %s failed" % dirname, e)
-            self.sendStatus({'header': '%s: %s: %s' % (self.header, e.strerror, dirname)})
-            self.sendStatus({'rc': e.errno})
+        rc = 1
+        for i in range(1, 10):
+            try:
+                if not os.path.isdir(dirname):
+                    os.makedirs(dirname)
+                rc = 0
+                break
+            except OSError, e:
+                rc = e.errno
+                log.msg("MakeDirectory %s failed" % dirname, e)
+                if not os.path.isdir(dirname):
+                    # delay after error
+                    yield task.deferLater(reactor, 30, lambda: None)
+                    if os.path.exists(dirname):
+                        if not os.path.isdir(dirname):
+                            log.msg('... mkdir path %s exists (but not directory)' % dirname)
+                            break
+                else:
+                    log.msg('... but directory exists: %s' % dirname)
+                
+        log.msg('... MakeDirectory %s: rc=%d' % (dirname, rc))
+        self.sendStatus({'rc': rc})
 
 
 class RemoveDirectory(base.Command):
@@ -63,7 +80,7 @@ class RemoveDirectory(base.Command):
         args = self.args
         dirnames = args['dir']
 
-        self.timeout = args.get('timeout', 120)
+        self.timeout = args.get('timeout', 600)
         self.maxTime = args.get('maxTime', None)
         self.rc = 0
         if isinstance(dirnames, list):
@@ -83,63 +100,6 @@ class RemoveDirectory(base.Command):
             self.rc = wfd.getResult()
 
         self.sendStatus({'rc': self.rc})
-
-    def removeSingleDir(self, dirname):
-        self.dir = os.path.join(self.builder.basedir, dirname)
-        if runtime.platformType != "posix":
-            d = threads.deferToThread(utils.rmdirRecursive, self.dir)
-
-            def cb(_):
-                return 0  # rc=0
-
-            def eb(f):
-                self.sendStatus({'header': 'exception from rmdirRecursive\n' + f.getTraceback()})
-                return -1  # rc=-1
-            d.addCallbacks(cb, eb)
-        else:
-            d = self._clobber(None)
-
-        return d
-
-    def _clobber(self, dummy, chmodDone=False):
-        command = ["rm", "-rf", self.dir]
-        c = runprocess.RunProcess(self.builder, command, self.builder.basedir,
-                                  sendRC=0, timeout=self.timeout, maxTime=self.maxTime,
-                                  logEnviron=self.logEnviron, usePTY=False)
-
-        self.command = c
-        # sendRC=0 means the rm command will send stdout/stderr to the
-        # master, but not the rc=0 when it finishes. That job is left to
-        # _sendRC
-        d = c.start()
-        # The rm -rf may fail if there is a left-over subdir with chmod 000
-        # permissions. So if we get a failure, we attempt to chmod suitable
-        # permissions and re-try the rm -rf.
-        if not chmodDone:
-            d.addCallback(self._tryChmod)
-        return d
-
-    def _tryChmod(self, rc):
-        assert isinstance(rc, int)
-        if rc == 0:
-            return defer.succeed(0)
-        # Attempt a recursive chmod and re-try the rm -rf after.
-
-        command = ["chmod", "-Rf", "u+rwx", os.path.join(self.builder.basedir, self.dir)]
-        if sys.platform.startswith('freebsd'):
-            # Work around a broken 'chmod -R' on FreeBSD (it tries to recurse into a
-            # directory for which it doesn't have permission, before changing that
-            # permission) by running 'find' instead
-            command = ["find", os.path.join(self.builder.basedir, self.dir),
-                       '-exec', 'chmod', 'u+rwx', '{}', ';']
-        c = runprocess.RunProcess(self.builder, command, self.builder.basedir,
-                                  sendRC=0, timeout=self.timeout, maxTime=self.maxTime,
-                                  logEnviron=self.logEnviron, usePTY=False)
-
-        self.command = c
-        d = c.start()
-        d.addCallback(lambda dummy: self._clobber(dummy, True))
-        return d
 
 
 class CopyDirectory(base.Command):

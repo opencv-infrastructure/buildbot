@@ -17,11 +17,13 @@
 import os
 import shutil
 import sys
+import traceback
 
 from base64 import b64encode
 
 from twisted.internet import defer
 from twisted.internet import reactor
+from twisted.internet import task
 from twisted.internet import threads
 from twisted.python import failure
 from twisted.python import log
@@ -33,6 +35,10 @@ from buildslave import util
 from buildslave.commands import utils
 from buildslave.exceptions import AbandonChain
 from buildslave.interfaces import ISlaveCommand
+
+from buildslave.deferredsharedlock import DeferredSharedLock
+
+commands_lock = DeferredSharedLock(8)
 
 # this used to be a CVS $-style "Revision" auto-updated keyword, but since I
 # moved to Darcs as the primary repository, this is updated manually each
@@ -146,6 +152,7 @@ class Command:
         self.stepId = stepId  # just for logging
         self.args = args
         self.startTime = None
+        self.lock_exclusive = False
 
         missingArgs = filter(lambda arg: arg not in args, self.requiredArgs)
         if missingArgs:
@@ -159,15 +166,41 @@ class Command:
 
     def doStart(self):
         self.running = True
-        self.startTime = util.now(self._reactor)
-        d = defer.maybeDeferred(self.start)
-
-        def commandComplete(res):
-            self.sendStatus({"elapsed": util.now(self._reactor) - self.startTime})
+        self.d_complete = defer.Deferred()
+        self.lock_startTime = util.now(self._reactor)
+        def _():
+            self.sendStatus({"header": "commands lock was acquired in %s sec\n\n" % \
+                             (util.now(self._reactor) - self.lock_startTime)})
+            if hasattr(self, 'd_lock'):
+                del self.d_lock
+            if not self.running:
+                return None
+            self.startTime = util.now(self._reactor)
+            log.msg("Start command at %s" % self.startTime)
+            d = defer.maybeDeferred(self.start)
+            def commandComplete(res):
+                self.sendStatus({"elapsed": util.now(self._reactor) - self.startTime})
+                return res
+            d.addBoth(commandComplete)
+            return d
+        if self.args.has_key('env'):
+            if type(self.args['env']) is dict:
+                if self.args['env'].has_key('BUILDBOT_COMMAND_EXCLUSIVE'):
+                    self.lock_exclusive = True;
+        if not self.lock_exclusive:
+            self.sendStatus({"header": "try to acquire commands lock\n"})
+            self.d_lock = d_lock = commands_lock.run(_);
+        else:
+            self.sendStatus({"header": "try to acquire EXCLUSIVE commands lock\n"})
+            self.d_lock = d_lock = commands_lock.runExclusive(_);
+        if self.d_lock.called:
+            del self.d_lock
+        def _complete(*args):
+            self.sendStatus({"header": "\n\ncommands lock was released\n"})
             self.running = False
-            return res
-        d.addBoth(commandComplete)
-        return d
+            self.d_complete.callback(*args)
+        d_lock.addBoth(_complete);
+        return self.d_complete
 
     def start(self):
         """Start the command. This method should return a Deferred that will
@@ -187,8 +220,19 @@ class Command:
         self.builder.sendUpdate(status)
 
     def doInterrupt(self):
-        self.running = False
-        self.interrupt()
+        if hasattr(self, 'd_lock'):
+            assert not self.d_lock.called;
+            if not self.lock_exclusive:
+                commands_lock._cancelAcquire(self.d_lock)
+            else:
+                commands_lock._cancelAcquireExclusive(self.d_lock)
+            del self.d_lock
+            self.sendStatus({"header": "cancel acquiring of commands lock (time %s)\n" % \
+                             (util.now(self._reactor) - self.lock_startTime)})
+            self.d_complete.callback(None)
+        else:
+            self.running = False
+            self.interrupt()
 
     def interrupt(self):
         """Override this in a subclass to allow commands to be interrupted.
@@ -216,6 +260,108 @@ class Command:
         log.msg(" abandoning chain", why.value)
         self.sendStatus({'rc': why.value.args[0]})
         return None
+    
+    def removeSingleDir(self, dirname):
+        if runtime.platformType == "win32":
+            dirname = os.path.join(*dirname.split('/'))
+        dirname = os.path.join(self.builder.basedir, dirname)
+        if runtime.platformType == "win32":
+            d = self._clobberWin(dirname)
+        elif runtime.platformType == "posix":
+            d = self._clobber(dirname)
+        else:
+            d = threads.deferToThread(shutil.rmtree, dirname)
+            def cb(_):
+                return 0 # rc=0
+            def eb(f):
+                self.sendStatus({'header' : 'exception from rmdirRecursive\n' + f.getTraceback()})
+                return -1 # rc=-1
+            d.addCallbacks(cb, eb)
+
+        return d
+
+    @defer.inlineCallbacks
+    def _clobber(self, dirname):
+        command = ["rm", "-rf", dirname]
+        c = runprocess.RunProcess(self.builder, command, self.builder.basedir,
+                         sendRC=0, timeout=self.timeout, maxTime=self.maxTime,
+                         logEnviron=self.logEnviron, usePTY=False)
+
+        rc = yield c.start()
+        
+        # The rm -rf may fail if there is a left-over subdir with chmod 000
+        # permissions. So if we get a failure, we attempt to chmod suitable
+        # permissions and re-try the rm -rf.
+        assert isinstance(rc, int)
+        if rc == 0:
+            defer.returnValue(0)
+        # Attempt a recursive chmod and re-try the rm -rf after.
+
+        command = ["chmod", "-Rf", "u+rwx", os.path.join(self.builder.basedir, dirname)]
+        if sys.platform.startswith('freebsd'):
+            # Work around a broken 'chmod -R' on FreeBSD (it tries to recurse into a
+            # directory for which it doesn't have permission, before changing that
+            # permission) by running 'find' instead
+            command = ["find", os.path.join(self.builder.basedir, dirname),
+                                '-exec', 'chmod', 'u+rwx', '{}', ';' ]
+        c = runprocess.RunProcess(self.builder, command, self.builder.basedir,
+                         sendRC=0, timeout=self.timeout, maxTime=self.maxTime,
+                         logEnviron=self.logEnviron, usePTY=False)
+
+        self.command = c
+        rc = yield c.start()
+        
+        command = ["rm", "-rf", dirname]
+        c = runprocess.RunProcess(self.builder, command, self.builder.basedir,
+                         sendRC=0, timeout=self.timeout, maxTime=self.maxTime,
+                         logEnviron=self.logEnviron, usePTY=False)
+
+        rc = yield c.start()
+        
+        defer.returnValue(rc)
+
+    @defer.inlineCallbacks
+    def _clobberWin(self, dirname):
+        if not os.path.exists(dirname):
+            log.msg('WARNING: rmdir: path doesn\'t exists: %s' % dirname)
+            defer.returnValue(0)
+
+        command = ['rmdir', '/Q', '/S', dirname]
+
+        c = runprocess.RunProcess(self.builder, command, self.builder.basedir,
+                         sendRC=False, timeout=self.timeout, maxTime=self.maxTime,
+                         logEnviron=self.logEnviron, usePTY=False, keepStderr=True)
+
+        rc = -1
+        try:
+            rc = yield c.start()
+        except:
+            log.msg('Exception during rmdir: %s' % traceback.format_exc())
+            
+        if rc == 0:
+            log.msg('First rmdir went fine.')
+            defer.returnValue(0)
+            
+        log.msg('rmdir: second try')
+
+        # delay
+        yield task.deferLater(reactor, 10, lambda: None)
+
+        rc = -1
+        try:
+            c = runprocess.RunProcess(self.builder, command, self.builder.basedir,
+                             sendRC=False, timeout=self.timeout, maxTime=self.maxTime,
+                             logEnviron=self.logEnviron, usePTY=False, keepStderr=True)
+            rc = yield c.start()
+        except:
+            log.msg('Exception during rmdir (2): %s' % traceback.format_exc())
+        
+        log.msg('WARNING: Second rmdir rc=%d' % rc)
+        if os.path.exists(dirname):
+            log.msg('ERROR: rmdir doesn\'t remove directory: %s' % dirname)
+        
+        defer.returnValue(rc)
+
 
 
 class SourceBaseCommand(Command):
@@ -321,7 +467,7 @@ class SourceBaseCommand(Command):
             # the directory cannot be updated, so we have to clobber it.
             # Perhaps the master just changed modes from 'export' to
             # 'update'.
-            d.addCallback(self.doClobber, self.srcdir)
+            d.addCallback(lambda _: self.removeSingleDir(self.srcdir))
 
         d.addCallback(self.doVC)
 
@@ -335,7 +481,7 @@ class SourceBaseCommand(Command):
     def maybeClobber(self, d):
         # do we need to clobber anything?
         if self.mode in ("copy", "clobber", "export"):
-            d.addCallback(self.doClobber, self.workdir)
+            d.addCallback(lambda _: self.removeSingleDir(self.workdir))
 
     def interrupt(self):
         self.interrupted = True
@@ -434,7 +580,7 @@ class SourceBaseCommand(Command):
         msg = "update failed, clobbering and trying again"
         self.sendStatus({'header': msg + "\n"})
         log.msg(msg)
-        d = self.doClobber(None, self.srcdir)
+        d = self.removeSingleDir(self.srcdir)
         d.addCallback(self.doVCFallback2)
         return d
 
@@ -486,69 +632,14 @@ class SourceBaseCommand(Command):
                 d = defer.Deferred()
                 # we are going to do a full checkout, so a clobber is
                 # required first
-                self.doClobber(d, self.workdir)
+                d.addCallback(lambda _: self.removeSingleDir(self.workdir))
                 if self.srcdir:
-                    self.doClobber(d, self.srcdir)
+                    d.addCallback(lambda _: self.removeSingleDir(self.srcdir))
                 d.addCallback(lambda res: self.doVCFull())
                 d.addBoth(self.maybeDoVCRetry)
                 self._reactor.callLater(delay, d.callback, None)
                 return d
         return res
-
-    def doClobber(self, dummy, dirname, chmodDone=False):
-        d = os.path.join(self.builder.basedir, dirname)
-        if runtime.platformType != "posix":
-            d = threads.deferToThread(utils.rmdirRecursive, d)
-
-            def cb(_):
-                return 0  # rc=0
-
-            def eb(f):
-                self.sendStatus({'header': 'exception from rmdirRecursive\n' + f.getTraceback()})
-                return -1  # rc=-1
-            d.addCallbacks(cb, eb)
-            return d
-        command = ["rm", "-rf", d]
-        c = runprocess.RunProcess(self.builder, command, self.builder.basedir,
-                                  sendRC=0, timeout=self.timeout, maxTime=self.maxTime,
-                                  logEnviron=self.logEnviron, usePTY=False)
-
-        self.command = c
-        # sendRC=0 means the rm command will send stdout/stderr to the
-        # master, but not the rc=0 when it finishes. That job is left to
-        # _sendRC
-        d = c.start()
-        # The rm -rf may fail if there is a left-over subdir with chmod 000
-        # permissions. So if we get a failure, we attempt to chmod suitable
-        # permissions and re-try the rm -rf.
-        if chmodDone:
-            d.addCallback(self._abandonOnFailure)
-        else:
-            d.addCallback(lambda rc: self.doClobberTryChmodIfFail(rc, dirname))
-        return d
-
-    def doClobberTryChmodIfFail(self, rc, dirname):
-        assert isinstance(rc, int)
-        if rc == 0:
-            return defer.succeed(0)
-        # Attempt a recursive chmod and re-try the rm -rf after.
-
-        command = ["chmod", "-Rf", "u+rwx", os.path.join(self.builder.basedir, dirname)]
-        if sys.platform.startswith('freebsd'):
-            # Work around a broken 'chmod -R' on FreeBSD (it tries to recurse into a
-            # directory for which it doesn't have permission, before changing that
-            # permission) by running 'find' instead
-            command = ["find", os.path.join(self.builder.basedir, dirname),
-                       '-exec', 'chmod', 'u+rwx', '{}', ';']
-        c = runprocess.RunProcess(self.builder, command, self.builder.basedir,
-                                  sendRC=0, timeout=self.timeout, maxTime=self.maxTime,
-                                  logEnviron=self.logEnviron, usePTY=False)
-
-        self.command = c
-        d = c.start()
-        d.addCallback(self._abandonOnFailure)
-        d.addCallback(lambda dummy: self.doClobber(dummy, dirname, True))
-        return d
 
     def doCopy(self, res):
         # now copy tree to workdir

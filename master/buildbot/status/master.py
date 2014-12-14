@@ -326,17 +326,18 @@ class Status(config.ReconfigurableServiceMixin, service.MultiService):
                 if got >= num_builds:
                     return
 
+    @defer.inlineCallbacks
     def subscribe(self, target):
         self.watchers.append(target)
         for name in self.botmaster.builderNames:
-            self.announceNewBuilder(target, name, self.getBuilder(name))
-
+            yield self.announceNewBuilder(target, name, self.getBuilder(name))
     def unsubscribe(self, target):
         self.watchers.remove(target)
 
     # methods called by upstream objects
+    @defer.inlineCallbacks
     def announceNewBuilder(self, target, name, builder_status):
-        t = target.builderAdded(name, builder_status)
+        t = yield target.builderAdded(name, builder_status)
         if t:
             builder_status.subscribe(t)
 

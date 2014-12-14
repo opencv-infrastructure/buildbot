@@ -154,6 +154,7 @@ class SVN(SourceBaseCommand):
                 continue
             yield filename
 
+    @defer.inlineCallbacks
     def _purgeAndUpdate2(self, res):
         for filename in self.getUnversionedFiles(self.command.stdout, self.keep_on_purge):
             filepath = os.path.join(self.builder.basedir, self.workdir,
@@ -163,11 +164,12 @@ class SVN(SourceBaseCommand):
                 os.chmod(filepath, 0700)
                 os.remove(filepath)
             else:
-                utils.rmdirRecursive(filepath)
+                yield self.removeSingleDir(filepath)
         # Now safe to update.
         revision = self.args['revision'] or 'HEAD'
-        return self._dovccmd('update', ['--revision', str(revision)],
+        res = yield self._dovccmd('update', ['--revision', str(revision)],
                              keepStdout=True)
+        defer.returnValue(res)
 
     def getSvnVersionCommand(self):
         """

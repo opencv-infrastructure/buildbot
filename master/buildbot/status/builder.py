@@ -29,6 +29,7 @@ from buildbot.status.build import BuildStatus
 from buildbot.status.buildrequest import BuildRequestStatus
 from buildbot.status.event import Event
 from buildbot.util.lru import LRUCache
+from twisted.internet import defer
 from twisted.persisted import styles
 from twisted.python import log
 from twisted.python import runtime
@@ -559,6 +560,7 @@ class BuilderStatus(styles.Versioned):
         return s
 
     # buildStarted is called by our child BuildStatus instances
+    @defer.inlineCallbacks
     def buildStarted(self, s):
         """Now the BuildStatus object is ready to go (it knows all of its
         Steps, its ETA, etc), so it is safe to notify our watchers."""
@@ -573,7 +575,7 @@ class BuilderStatus(styles.Versioned):
 
         for w in self.watchers:  # TODO: maybe do this later? callLater(0)?
             try:
-                receiver = w.buildStarted(self.getName(), s)
+                receiver = yield w.buildStarted(self.getName(), s)
                 if receiver:
                     if isinstance(receiver, type(())):
                         s.subscribe(receiver[0], receiver[1])

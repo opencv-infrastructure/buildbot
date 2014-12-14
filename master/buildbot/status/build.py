@@ -232,6 +232,7 @@ class BuildStatus(styles.Versioned, properties.PropertiesMixin):
     def subscribe(self, receiver, updateInterval=None):
         # will receive stepStarted and stepFinished messages
         # and maybe buildETAUpdate
+        assert not isinstance(receiver, defer.Deferred)
         self.watchers.append(receiver)
         if updateInterval is not None:
             self.sendETAUpdate(receiver, updateInterval)

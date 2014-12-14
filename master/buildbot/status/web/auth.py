@@ -107,28 +107,37 @@ class HTPasswdAuth(AuthBase):
         if not os.path.exists(self.file):
             self.err = "No such file: " + self.file
             return False
-        # Fetch each line from the .htpasswd file and split it into a
-        # [user, passwd] array.
-        lines = [l.rstrip().split(':', 1)
-                 for l in file(self.file).readlines()]
-        # Keep only the line for this login
-        lines = [l for l in lines if l[0] == user]
-        if not lines:
-            self.err = "Invalid user/passwd"
+        try:
+            # Fetch each line from the .htpasswd file and split it into a
+            # [user, passwd] array.
+            lines = [l.rstrip().split(':', 2)
+                     for l in file(self.file).readlines() if len(l) > 0 and not l.startswith('#')]
+            # Keep only the line for this login
+            lines = [l for l in lines if l[0] == user]
+            if not lines:
+                self.err = "Invalid user/passwd"
+                return False
+            hash = lines[0][1]
+            res = self.validatePassword(passwd, hash)
+            if res:
+                self.err = ""
+            else:
+                self.err = "Invalid user/passwd"
+            return res
+        except:
+            self.err = "Internal error"
             return False
-        hash = lines[0][1]
-        res = self.validatePassword(passwd, hash)
-        if res:
-            self.err = ""
-        else:
-            self.err = "Invalid user/passwd"
-        return res
 
     def validatePassword(self, passwd, hash):
         # This is the DES-hash of the password. The first two characters are
         # the salt used to introduce disorder in the DES algorithm.
         from crypt import crypt  # @UnresolvedImport
-        return hash == crypt(passwd, hash[0:2])
+        if hash == crypt(passwd, hash[0:2]):
+            return True
+        # Another algorithm
+        if len(hash) > 12 and hash == crypt(passwd, hash[0:12]):
+            return True
+        return False
 
 
 class HTPasswdAprAuth(HTPasswdAuth):

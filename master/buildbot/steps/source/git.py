@@ -210,6 +210,13 @@ class Git(Source):
             yield self._fullCloneOrFallback()
             return
 
+        # Fetch remote data (required to update TAGs info!)
+        rc = yield self._fetch(None)
+        if rc != 0:
+            rc = yield self._fetch(None)
+            if rc != 0:
+                raise buildstep.BuildStepFailed()
+
         # test for existence of the revision; rc=1 indicates it does not exist
         if self.revision:
             rc = yield self._dovccmd(['cat-file', '-e', self.revision],
