@@ -37,6 +37,11 @@ from buildbot.status.results import WARNINGS
 from buildbot.status.results import worst_status
 from buildbot.util.eventual import eventually
 
+class BuildFailed(Exception):
+    pass
+
+class BuildStop(Exception):
+    pass
 
 class Build(properties.PropertiesMixin):
 
@@ -276,7 +281,7 @@ class Build(properties.PropertiesMixin):
             return d
 
         self.build_status.buildStarted(self)
-        self.acquireLocks().addCallback(self._startBuild_2)
+        self.acquireLocks().addCallback(self.lauchJob)
         return d
 
     @staticmethod
@@ -306,51 +311,73 @@ class Build(properties.PropertiesMixin):
             lock.claim(self, access)
         return defer.succeed(None)
 
-    def _startBuild_2(self, res):
-        self.startNextStep()
+    def addStep(self, step, insertPosition=0):
+        assert step._step_status is None, "Step was already used. Always create new instance!"
+
+        step.setBuild(self)
+        step.setBuildSlave(self.slavebuilder.slave)
+        # TODO: remove once we don't have anything depending on setDefaultWorkdir
+        if callable(self.workdir):
+            step.setDefaultWorkdir(self.workdir(self.sources))
+        else:
+            step.setDefaultWorkdir(self.workdir)
+        name = step.name
+        if name in self.stepnames:
+            count = self.stepnames[name]
+            count += 1
+            self.stepnames[name] = count
+            name = step.name + "_%d" % count
+        else:
+            self.stepnames[name] = 0
+        step.name = name
+        buildStatusInsertPosition = None
+        if insertPosition is None:
+            index = len(self.steps)
+        elif isinstance(insertPosition, int):
+            index = insertPosition
+            if index < len(self.steps):
+                buildStatusInsertPosition = self.steps[index]._step_status.step_number
+        else:
+            try:
+                index = self.steps.index(insertPosition)
+                buildStatusInsertPosition = insertPosition._step_status
+                index += 1
+            except ValueError:
+                index = 0
+                if len(self.steps) > 0:
+                    buildStatusInsertPosition = self.steps[0]._step_status.step_number
+        self.steps.insert(index, step)
+
+        # tell the BuildStatus about the step. This will create a
+        # BuildStepStatus and bind it to the Step.
+        step_status = self.build_status.addStepWithName(name, buildStatusInsertPosition)
+        step.setStepStatus(step_status)
+
+        sp = None
+        if self.useProgress:
+            # XXX: maybe bail if step.progressMetrics is empty? or skip
+            # progress for that one step (i.e. "it is fast"), or have a
+            # separate "variable" flag that makes us bail on progress
+            # tracking
+            sp = step.setupProgress()
+        if sp:
+            self.progress.addStepProgress(sp)
+
+        return step
 
     def setupBuild(self, expectations):
         # create the actual BuildSteps. If there are any name collisions, we
         # add a count to the loser until it is unique.
         self.steps = []
         self.stepStatuses = {}
-        stepnames = {}
-        sps = []
+        self.stepnames = {}
+
+        if self.useProgress:
+            self.progress = BuildProgress()
 
         for factory in self.stepFactories:
             step = factory.buildStep()
-            step.setBuild(self)
-            step.setBuildSlave(self.slavebuilder.slave)
-            # TODO: remove once we don't have anything depending on setDefaultWorkdir
-            if callable(self.workdir):
-                step.setDefaultWorkdir(self.workdir(self.sources))
-            else:
-                step.setDefaultWorkdir(self.workdir)
-            name = step.name
-            if name in stepnames:
-                count = stepnames[name]
-                count += 1
-                stepnames[name] = count
-                name = step.name + "_%d" % count
-            else:
-                stepnames[name] = 0
-            step.name = name
-            self.steps.append(step)
-
-            # tell the BuildStatus about the step. This will create a
-            # BuildStepStatus and bind it to the Step.
-            step_status = self.build_status.addStepWithName(name)
-            step.setStepStatus(step_status)
-
-            sp = None
-            if self.useProgress:
-                # XXX: maybe bail if step.progressMetrics is empty? or skip
-                # progress for that one step (i.e. "it is fast"), or have a
-                # separate "variable" flag that makes us bail on progress
-                # tracking
-                sp = step.setupProgress()
-            if sp:
-                sps.append(sp)
+            self.addStep(step, None)
 
         # Create a buildbot.status.progress.BuildProgress object. This is
         # called once at startup to figure out how to build the long-term
@@ -358,10 +385,8 @@ class Build(properties.PropertiesMixin):
         # fresh BuildProgress object to track progress for that individual
         # build. TODO: revisit at-startup call
 
-        if self.useProgress:
-            self.progress = BuildProgress(sps)
-            if self.progress and expectations:
-                self.progress.setExpectationsFrom(expectations)
+        if self.progress and expectations:
+            self.progress.setExpectationsFrom(expectations)
 
         # we are now ready to set up our BuildStatus.
         # pass all sourcestamps to the buildstatus
@@ -379,6 +404,69 @@ class Build(properties.PropertiesMixin):
         self.results = []  # list of FAILURE, SUCCESS, WARNINGS, SKIPPED
         self.result = SUCCESS  # overall result, may downgrade after each step
         self.text = []  # list of text string lists (text2)
+
+    def lauchJob(self, *args, **kwargs):
+        # Job will live asyncroniously
+        self.doJob_()
+
+    @defer.inlineCallbacks
+    def doJob_(self):
+        try:
+            try:
+                yield self.run()
+                yield self.runCleanup()
+            except BuildFailed as e:
+                yield self.runCleanup()
+            yield self.runExistedSteps()
+            yield self.allStepsDone()
+        except BuildStop as e:
+            yield self.allStepsDone()
+        except Exception as e:
+            log.err()
+            yield self.buildException(e)
+
+    def run(self):
+        pass
+
+    def runCleanup(self):
+        pass
+
+    @defer.inlineCallbacks
+    def runExistedSteps(self):
+        while True:
+            s = self.getNextStep()
+            if not s:
+                break
+            yield self._processStep(s)
+
+    @defer.inlineCallbacks
+    def processStep(self, step):
+        assert self.currentStep is None
+        if step._step_status is None:
+            yield self.addStep(step, 0)
+        try:
+            self.steps.remove(step)
+        except:
+            pass
+        isTerminateStage = self.terminate
+        yield self._processStep(step)
+        if not isTerminateStage and self.terminate:
+            raise BuildFailed()
+
+    @defer.inlineCallbacks
+    def _processStep(self, step):
+        assert self.currentStep is None
+        if self.stopped:
+            raise BuildStop()
+        self.currentStep = step
+        try:
+            results = yield step.startStep(self.remote)
+            self.currentStep = None
+            terminate = self.stepDone(results, step)  # interpret/merge results
+            if terminate:
+                self.terminate = True
+        finally:
+            self.currentStep = None
 
     def getNextStep(self):
         """This method is called to obtain the next BuildStep for this build.
@@ -398,27 +486,6 @@ class Build(properties.PropertiesMixin):
                     return None
         else:
             return self.steps.pop(0)
-
-    def startNextStep(self):
-        try:
-            s = self.getNextStep()
-        except StopIteration:
-            s = None
-        if not s:
-            return self.allStepsDone()
-        self.currentStep = s
-        d = defer.maybeDeferred(s.startStep, self.remote)
-        d.addCallback(self._stepDone, s)
-        d.addErrback(self.buildException)
-
-    def _stepDone(self, results, step):
-        self.currentStep = None
-        if self.finished:
-            return  # build was interrupted, don't keep building
-        terminate = self.stepDone(results, step)  # interpret/merge results
-        if terminate:
-            self.terminate = True
-        return self.startNextStep()
 
     def stepDone(self, result, step):
         """This method is called when the BuildStep completes. It is passed a

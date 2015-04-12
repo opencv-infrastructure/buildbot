@@ -145,14 +145,19 @@ class BuildProgress(pb.Referenceable):
     objects.
     """
 
-    def __init__(self, stepProgresses):
+    def __init__(self, stepProgresses=None):
         self.steps = {}
-        for s in stepProgresses:
-            self.steps[s.name] = s
-            s.setBuildProgress(self)
+        if stepProgresses is not None:
+            for s in stepProgresses:
+                self.steps[s.name] = s
+                s.setBuildProgress(self)
         self.finishedSteps = []
         self.watchers = {}
         self.debug = 0
+
+    def addStepProgress(self, stepProgress):
+        self.steps[stepProgress.name] = stepProgress
+        stepProgress.setBuildProgress(self)
 
     def setExpectationsFrom(self, exp):
         """Set our expectations from the builder's Expectations object."""

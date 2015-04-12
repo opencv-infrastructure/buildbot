@@ -259,14 +259,28 @@ class BuildStatus(styles.Versioned, properties.PropertiesMixin):
 
     # methods for the base.Build to invoke
 
-    def addStepWithName(self, name):
+    def updateStepNumbers_(self):
+        for i, s in enumerate(self.steps):
+            s.step_number = i
+
+    def addStepWithName(self, name, insertPosition=None):
         """The Build is setting up, and has added a new BuildStep to its
         list. Create a BuildStepStatus object to which it can send status
         updates."""
 
         s = BuildStepStatus(self, self.master, len(self.steps))
         s.setName(name)
-        self.steps.append(s)
+        if insertPosition is None:
+            index = len(self.steps)
+        elif isinstance(insertPosition, int):
+            index = insertPosition
+        else:
+            try:
+                index = self.steps.index(insertPosition) + 1
+            except ValueError:
+                index = 0
+        self.steps.insert(index, s)
+        self.updateStepNumbers_()
         return s
 
     def addTestResult(self, result):
