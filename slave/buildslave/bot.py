@@ -13,10 +13,12 @@
 #
 # Copyright Buildbot Team Members
 
+import new
 import os.path
 import signal
 import socket
 import sys
+import types
 
 from twisted.application import internet
 from twisted.application import service
@@ -34,6 +36,21 @@ from buildslave import monkeypatches
 from buildslave.commands import base
 from buildslave.commands import registry
 from buildslave.pbutil import ReconnectingPBClientFactory
+
+
+class Proxy(object):
+
+    def __init__(self, target):
+        self._target = target;
+
+    def __getattribute__(self, name):
+        try:
+            return object.__getattribute__(self, name)
+        except AttributeError:
+            att = getattr(object.__getattribute__(self, '_target'), name)
+            if isinstance(att, types.MethodType):
+                return new.instancemethod(att.im_func, self, object.__getattribute__(self, '_target').__class__)
+            return att
 
 
 class UnknownCommand(pb.Error):
@@ -54,12 +71,18 @@ class SlaveBuilder(pb.Referenceable, service.Service):
     # is severed.
     remote = None
 
-    # .command points to a SlaveCommand instance, and is set while the step
-    # is running. We use it to implement the stopBuild method.
-    command = None
+    # .commands points to a SlaveCommand instances (via unique stepId), and instance is available while the step
+    # is running. We use it to implement the stopBuild method (via interrupt).
+    commands = {}
 
-    # .remoteStep is a ref to the master-side BuildStep object, and is set
-    # when the step is started
+    # To support multiple commands we fork(proxy) current instance to override access for command/remoteStep fields.
+    # Only cloned instances use fields below
+
+    # .command points to a SlaveCommand instance
+    command = None
+    # .stepId identifies command, value is passed from the buildbot to start/interrupt commands
+    stepId = None
+    # .remoteStep is a ref to the master-side BuildStep object, and is set when the command is started
     remoteStep = None
 
     def __init__(self, name):
@@ -87,7 +110,7 @@ class SlaveBuilder(pb.Referenceable, service.Service):
     def stopService(self):
         service.Service.stopService(self)
         if self.stopCommandOnShutdown:
-            self.stopCommand()
+            self.stopCommands()
 
     def activity(self):
         bot = self.parent
@@ -133,34 +156,38 @@ class SlaveBuilder(pb.Referenceable, service.Service):
 
         self.activity()
 
-        if self.command:
-            log.msg("leftover command, dropping it")
-            self.stopCommand()
+        assert not stepId in self.commands
+        assert self.command is None
 
         try:
             factory = registry.getFactory(command)
         except KeyError:
             raise UnknownCommand("unrecognized SlaveCommand '%s'" % command)
-        self.command = factory(self, stepId, args)
+
+        # We fork here to many instances, one for each command
+        builder = Proxy(self)
+        builder.stepId = stepId
+        builder.command = factory(builder, stepId, args)
+        self.commands[stepId] = builder.command
 
         log.msg(" startCommand:%s [id %s]" % (command, stepId))
-        self.remoteStep = stepref
-        self.remoteStep.notifyOnDisconnect(self.lostRemoteStep)
-        d = self.command.doStart()
+        builder.remoteStep = stepref
+        builder.remoteStep.notifyOnDisconnect(builder.lostRemoteStep)
+        d = builder.command.doStart()
         d.addCallback(lambda res: None)
-        d.addBoth(self.commandComplete)
+        d.addBoth(builder.commandComplete)
         return None
 
     def remote_interruptCommand(self, stepId, why):
         """Halt the current step."""
         log.msg("asked to interrupt current command: %s" % why)
         self.activity()
-        if not self.command:
+        if not stepId in self.commands:
             # TODO: just log it, a race could result in their interrupting a
             # command that wasn't actually running
             log.msg(" .. but none was running")
             return
-        self.command.doInterrupt()
+        self.commands[stepId].doInterrupt()
 
     def stopCommand(self):
         """Make any currently-running command die, with no further status
@@ -172,6 +199,19 @@ class SlaveBuilder(pb.Referenceable, service.Service):
         log.msg("stopCommand: halting current command %s" % self.command)
         self.command.doInterrupt()  # shut up! and die!
         self.command = None  # forget you!
+
+    def stopCommands(self):
+        """Make any currently-running command die, with no further status
+        output. This is used when the buildslave is shutting down or the
+        connection to the master has been lost. Interrupt the command,
+        silence it, and then forget about it."""
+        for command in self.commands:
+            try:
+                log.msg("stopCommands: halting running command %s" % self.command)
+                command.doInterrupt()  # shut up! and die!
+            except:
+                log.err()
+        self.commands.clear()
 
     # sendUpdate is invoked by the Commands we spawn
     def sendUpdate(self, data):
@@ -218,6 +258,8 @@ class SlaveBuilder(pb.Referenceable, service.Service):
         else:
             # failure is None
             log.msg("SlaveBuilder.commandComplete", self.command)
+        if self.stepId in self.commands:
+            del self.commands[self.stepId]
         self.command = None
         if not self.running:
             log.msg(" but we weren't running, quitting silently")
