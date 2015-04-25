@@ -87,6 +87,10 @@ class BuildStep(object, properties.PropertiesMixin):
 
     implements(interfaces.IBuildStep)
 
+    _completionResult = None
+    _dependsOnStep = None  # list of steps
+    _completionCallback = None
+
     haltOnFailure = False
     flunkOnWarnings = False
     flunkOnFailure = False
@@ -147,6 +151,9 @@ class BuildStep(object, properties.PropertiesMixin):
     _step_status = None
 
     def __init__(self, **kwargs):
+        self._dependsOnStep = []
+        self._completionCallback = []
+
         for p in self.__class__.parms:
             if p in kwargs:
                 setattr(self, p, kwargs[p])
@@ -248,6 +255,24 @@ class BuildStep(object, properties.PropertiesMixin):
             if buildResult and not isinstance(buildResult, unicode):
                 raise TypeError("build result must be unicode")
             self._step_status.setText2([buildResult] if buildResult else [])
+
+    def dependsOnStep(self, step):
+        self._dependsOnStep.append(step)
+
+    def isReady(self):
+        if self._dependsOnStep:
+            for step in self._dependsOnStep:
+                if step._completionResult is None:
+                    return False
+        return True
+
+    def addCompletionCallback(self, cb):
+        self._completionCallback.append(cb)
+
+    @defer.inlineCallbacks
+    def onCompletion(self, result):
+        for cb in self._completionCallback:
+            yield cb(self, result)
 
     @defer.inlineCallbacks
     def startStep(self, remote):

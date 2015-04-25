@@ -85,12 +85,16 @@ class Build(properties.PropertiesMixin):
         self.reason = requests[0].mergeReasons(requests[1:])
 
         self.progress = None
-        self.currentStep = None
+        self.currentSteps = []
         self.slaveEnvironment = {}
 
         self.terminate = False
 
         self._acquiringLock = None
+
+    @property
+    def currentStep(self):
+        assert False, "Build: .currentStep is not available, use .currentSteps"
 
     def setBuilder(self, builder):
         """
@@ -311,7 +315,7 @@ class Build(properties.PropertiesMixin):
             lock.claim(self, access)
         return defer.succeed(None)
 
-    def addStep(self, step, insertPosition=0):
+    def addStep(self, step, insertPosition=0, addToQueue=True):
         assert step._step_status is None, "Step was already used. Always create new instance!"
 
         step.setBuild(self)
@@ -339,14 +343,15 @@ class Build(properties.PropertiesMixin):
                 buildStatusInsertPosition = self.steps[index]._step_status.step_number
         else:
             try:
-                index = self.steps.index(insertPosition)
                 buildStatusInsertPosition = insertPosition._step_status
+                index = self.steps.index(insertPosition)
                 index += 1
             except ValueError:
                 index = 0
-                if len(self.steps) > 0:
+                if len(self.steps) > 0 and buildStatusInsertPosition is None:
                     buildStatusInsertPosition = self.steps[0]._step_status.step_number
-        self.steps.insert(index, step)
+        if addToQueue:
+            self.steps.insert(index, step)
 
         # tell the BuildStatus about the step. This will create a
         # BuildStepStatus and bind it to the Step.
@@ -441,32 +446,109 @@ class Build(properties.PropertiesMixin):
 
     @defer.inlineCallbacks
     def processStep(self, step):
-        assert self.currentStep is None
+        if len(self.currentSteps) > 0:
+            assert len(self.currentSteps) == 0
         if step._step_status is None:
-            yield self.addStep(step, 0)
-        try:
-            self.steps.remove(step)
-        except:
-            pass
+            yield self.addStep(step, insertPosition=0, addToQueue=False)
         isTerminateStage = self.terminate
         yield self._processStep(step)
         if not isTerminateStage and self.terminate:
             raise BuildFailed()
 
     @defer.inlineCallbacks
+    def processStepsInParallel(self, steps, maxCount=2):
+        assert len(self.currentSteps) == 0
+        for step in steps:
+            if step._step_status is None:
+                yield self.addStep(step, insertPosition=None, addToQueue=True)
+            elif not step in self.steps:
+                self.steps.append(step)
+
+        build = self
+
+        class ParallelStepsProcessor():
+
+            def __init__(self):
+                self.launched = []
+                self.launched_deferred_results = []
+
+            def inProgress(self):
+                return len(self.launched)
+
+            def launch(self, step):
+                assert not step in build.currentSteps
+                if build.stopped:
+                    raise BuildStop()
+                build.currentSteps.append(step)
+                deferedResult = step.startStep(build.remote)
+                self.launched.append(step)
+                self.launched_deferred_results.append(deferedResult)
+
+            @defer.inlineCallbacks
+            def waitForOneStepCompletion(self):
+                """Returns True on build termination"""
+                results, index = yield defer.DeferredList(self.launched_deferred_results, fireOnOneCallback=True, fireOnOneErrback=True, consumeErrors=False)
+                completedStep = self.launched[index]
+                del self.launched[index]
+                del self.launched_deferred_results[index]
+                build.currentSteps.remove(completedStep)
+                terminate = build.stepDone(results, completedStep)  # interpret/merge results
+                yield completedStep.onCompletion(results)
+                if terminate:
+                    build.terminate = True
+                defer.returnValue(terminate)
+
+            def getNextStep(self):
+                for s in build.steps:
+                    if s.isReady():
+                        build.steps.remove(s)
+                        return s
+                return len(build.steps) == 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, type, value, tb):
+                try:
+                    while self.inProgress() > 0:
+                        yield self.waitForOneStepCompletion()
+                except:
+                    log.err()
+                for step in self.launched:
+                    if step in build.currentSteps:
+                        build.currentSteps.remove(step)
+
+
+        with ParallelStepsProcessor() as parallelSteps:
+            while True:
+                step = parallelSteps.getNextStep()
+                if step is True:
+                    if parallelSteps.inProgress() == 0:
+                        break
+                elif step is not False:
+                    parallelSteps.launch(step)
+
+                if parallelSteps.inProgress() == maxCount or step in [True, False]:
+                    if (yield parallelSteps.waitForOneStepCompletion()):
+                        break
+
+        if self.terminate:
+            raise BuildFailed()
+
+    @defer.inlineCallbacks
     def _processStep(self, step):
-        assert self.currentStep is None
+        assert not step in self.currentSteps
         if self.stopped:
             raise BuildStop()
-        self.currentStep = step
+        self.currentSteps.append(step)
         try:
             results = yield step.startStep(self.remote)
-            self.currentStep = None
             terminate = self.stepDone(results, step)  # interpret/merge results
+            yield step.onCompletion(results)
             if terminate:
                 self.terminate = True
         finally:
-            self.currentStep = None
+            self.currentSteps.remove(step)
 
     def getNextStep(self):
         """This method is called to obtain the next BuildStep for this build.
@@ -480,6 +562,7 @@ class Build(properties.PropertiesMixin):
             # Run any remaining alwaysRun steps, and skip over the others
             while True:
                 s = self.steps.pop(0)
+                assert s.isReady()
                 if s.alwaysRun:
                     return s
                 if not self.steps:
@@ -503,6 +586,8 @@ class Build(properties.PropertiesMixin):
             self.text.extend(text)
         if not self.remote:
             terminate = True
+
+        step._completionResult = result
 
         possible_overall_result = result
         if result == FAILURE:
@@ -536,10 +621,11 @@ class Build(properties.PropertiesMixin):
         # TODO: see if we can resume the build when it reconnects.
         log.msg("%s.lostRemote" % self)
         self.remote = None
-        if self.currentStep:
-            # this should cause the step to finish.
-            log.msg(" stopping currentStep", self.currentStep)
-            self.currentStep.interrupt(Failure(error.ConnectionLost()))
+        if len(self.currentSteps) > 0:
+            for step in self.currentSteps:
+                # this should cause the step to finish.
+                log.msg(" stopping current step", step)
+                step.interrupt(Failure(error.ConnectionLost()))
         else:
             self.result = RETRY
             self.text = ["lost", "remote"]
@@ -563,8 +649,8 @@ class Build(properties.PropertiesMixin):
         # TODO: include 'reason' in this point event
         self.builder.builder_status.addPointEvent(['interrupt'])
         self.stopped = True
-        if self.currentStep:
-            self.currentStep.interrupt(reason)
+        for step in self.currentSteps:
+            step.interrupt(reason)
 
         self.result = EXCEPTION
 
