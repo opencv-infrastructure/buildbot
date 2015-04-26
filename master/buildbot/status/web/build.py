@@ -35,6 +35,7 @@ from buildbot.status.web.base import getRequestCharset
 from buildbot.status.web.base import path_to_authzfail
 from buildbot.status.web.base import path_to_build
 from buildbot.status.web.base import path_to_builder
+from buildbot.status.web.base import path_to_root
 from buildbot.status.web.base import path_to_slave
 from buildbot.status.web.step import StepsResource
 from buildbot.status.web.tests import TestsResource
@@ -233,7 +234,11 @@ class StatusResourceBuild(HtmlResource):
             step['link'] = req.childLink("steps/%s" %
                                          urllib.quote(s.getName(), safe=''))
             step['text'] = " ".join([str(txt) for txt in s.getText()])
-            step['urls'] = map(lambda x: dict(url=x[1], logname=x[0]), s.getURLs().items())
+            def getURL(url):
+                if url.startswith('http') or url.startswith('/') or url.startswith('./'):
+                    return url
+                return path_to_root(req) + url
+            step['urls'] = map(lambda x: dict(url=getURL(x[1]), logname=x[0]), s.getURLs().items())
 
             step['logs'] = []
             for l in s.getLogs():
