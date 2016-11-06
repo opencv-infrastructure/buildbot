@@ -287,7 +287,7 @@ class RemoteShellCommand(RemoteCommand):
 
     def __init__(self, workdir, command, env=None,
                  want_stdout=1, want_stderr=1,
-                 timeout=20 * 60, maxTime=None, sigtermTime=None,
+                 timeout=20 * 60, maxTime=None, sigtermTime=30,
                  logfiles={}, usePTY="slave-config", logEnviron=True,
                  collectStdout=False, collectStderr=False,
                  interruptSignal=None,
