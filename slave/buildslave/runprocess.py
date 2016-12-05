@@ -44,6 +44,31 @@ from buildslave.exceptions import AbandonChain
 if runtime.platformType == 'posix':
     from twisted.internet.process import Process
 
+if runtime.platformType == "win32":
+    win32process = None
+    try:
+        import win32process
+        import win32api
+        import win32con
+    except ImportError:
+        pass
+
+    oldCreateProcess = getattr(win32process, "CreateProcess", None)
+
+    def patchedCreateProcess(appName, commandLine, processAttributes,
+                             threadAttributes, bInheritHandles, dwCreationFlags,
+                             newEnvironment, currentDirectory, startupinfo):
+        print("Patched create process %s..." % appName)
+        dwCreationFlags = dwCreationFlags | win32process.CREATE_NEW_PROCESS_GROUP
+        return oldCreateProcess(appName, commandLine, processAttributes,
+                                threadAttributes, bInheritHandles, dwCreationFlags,
+                                newEnvironment, currentDirectory, startupinfo)
+
+    if win32process:
+        win32process.CreateProcess = patchedCreateProcess
+    else:
+        print("WARNING: Can't patch CreateProcess call. Process interruption may work incorrectly!")
+
 
 def win32_batch_quote(cmd_list):
     # Quote cmd_list to a string that is suitable for inclusion in a
@@ -844,19 +869,37 @@ class RunProcess:
             if interruptSignal is None:
                 log.msg("interruptSignal==None, only pretending to kill child")
             elif self.process.pid is not None:
-                if interruptSignal == "TERM":
-                    log.msg("using TASKKILL PID /T to kill pid %s" % self.process.pid)
-                    subprocess.check_call("TASKKILL /PID %s /T" % self.process.pid)
-                    log.msg("taskkill'd pid %s" % self.process.pid)
-                    hit = 1
-                elif interruptSignal == "KILL":
-                    log.msg("using TASKKILL PID /F /T to kill pid %s" % self.process.pid)
-                    subprocess.check_call("TASKKILL /F /PID %s /T" % self.process.pid)
-                    log.msg("taskkill'd pid %s" % self.process.pid)
-                    hit = 1
+                try:
+                    if interruptSignal == "TERM":
+                        log.msg("using TASKKILL PID /T to kill pid %s" % self.process.pid)
+                        subprocess.check_call("TASKKILL /PID %s /T" % self.process.pid)
+                        log.msg("taskkill'd pid %s" % self.process.pid)
+                        hit = 1
+                    elif interruptSignal == "KILL":
+                        log.msg("using TASKKILL PID /F /T to kill pid %s" % self.process.pid)
+                        subprocess.check_call("TASKKILL /F /PID %s /T" % self.process.pid)
+                        log.msg("taskkill'd pid %s" % self.process.pid)
+                        hit = 1
+                except:
+                    log.err()
 
         # try signalling the process itself (works on Windows too, sorta)
-        if not hit:
+        if not hit and (runtime.platformType == "win32" and interruptSignal == "TERM"):
+            try:
+                def _sendBreak():
+                    log.msg('sending GenerateConsoleCtrlEvent PID = %s' % self.process.pid)
+                    import ctypes
+                    CREATE_NEW_PROCESS_GROUP = 512
+                    CTRL_BREAK_EVENT = 1
+                    GenerateConsoleCtrlEvent = ctypes.windll.kernel32.GenerateConsoleCtrlEvent
+                    res = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, int(self.process.pid))
+                    log.msg('sending GenerateConsoleCtrlEvent result = %s' % res)
+                    return res != 0
+                hit = _sendBreak()
+            except:
+                log.err()
+                pass
+        elif not hit:
             try:
                 log.msg("trying process.signalProcess('%s')" % (interruptSignal,))
                 self.process.signalProcess(interruptSignal)
