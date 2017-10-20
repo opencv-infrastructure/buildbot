@@ -113,7 +113,17 @@ class Properties(util.ComparableMixin):
 
     def updateFromProperties(self, other):
         """Update this object based on another object; the other object's """
-        self.properties.update(other.properties)
+        if self.properties:
+            for k, v in other.properties.iteritems():
+                optional = True if k.endswith('-default') else False
+                key = k if not optional else k[:-len('-default')]
+                if key in self.properties and optional:
+                    print('Preserve existed property "%s" = "%s" (default: "%s")' % (key, self.properties[key], v))
+                    pass # skip update
+                else:
+                    self.properties[key] = v
+        else:
+            self.properties.update(other.properties)
         self.runtime.update(other.runtime)
 
     def updateFromPropertiesNoRuntime(self, other):
