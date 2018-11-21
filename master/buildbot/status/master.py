@@ -268,7 +268,15 @@ class Status(config.ReconfigurableServiceMixin, service.MultiService):
 
     def generateFinishedBuilds(self, builders=[], branches=[],
                                num_builds=None, finished_before=None,
-                               max_search=200):
+                               max_search=None):
+
+        if max_search is None:
+            # If max > buildCacheSize, it'll trash the cache...
+            cache_size = self.master.config.caches['Builds']
+            try:
+                max_search = min(50, int(cache_size))
+            except (TypeError, ValueError):
+                max_search = 50
 
         def want_builder(bn):
             if builders:
