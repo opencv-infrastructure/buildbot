@@ -366,7 +366,7 @@ else:
     if sys.version_info[:2] >= (2, 6):
         setup_args['install_requires'] += [
             'twisted >= 11.0.0, < 14.0.0',
-            'Jinja2 >= 2.1',
+            'Jinja2 >= 2.1, < 3.0',
         ]
     else:
         # Latest supported on Python 2.5 version of Twisted is 12.10, and
