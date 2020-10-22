@@ -572,6 +572,7 @@ class BuildLineMixin:
         values = {'class': css_class,
                   'builder_name': builder_name,
                   'buildnum': build.getNumber(),
+                  'buildworker': build.getSlavename(),
                   'results': css_class,
                   'text': " ".join(build.getText()),
                   'buildurl': path_to_build(req, build),
@@ -584,6 +585,16 @@ class BuildLineMixin:
                   'reason': build.getReason(),
                   'interested_users': build.getInterestedUsers(),
                   }
+
+        (start, end) = build.getTimes()
+        values['start'] = time.ctime(start)
+        if end:
+            values['end'] = time.ctime(end)
+            values['elapsed'] = util.formatInterval(end - start)
+        else:
+            now = util.now()
+            values['elapsed'] = util.formatInterval(now - start)
+
         return values
 
 
